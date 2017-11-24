@@ -21,7 +21,6 @@
  
 #include <iostream>
 #include <stdexcept>
-#include <utility>
 #include <iomanip>
 #include <cstring>
 #include <random>
@@ -29,33 +28,6 @@
 #include <string>
 #include <chrono>
 #include "libusb.h"
-
-/**
- * Ruft im Destruktor das zuvor im Konstruktor übergebene Funktional (Lambda, Funktions-Zeiger, Klasse mit ()-Operator) auf.
- */
-template <typename F>
-class Cleaner {
-	public:
-		template <typename T>
-		Cleaner (T&& src) : m_f (std::forward<T> (src)) {}
-		Cleaner (const F& src) : m_f (src) {}
-		Cleaner (Cleaner&&) = default;
-		Cleaner (const Cleaner&) = default;
-		Cleaner& operator = (Cleaner&&) = default;
-		Cleaner& operator = (const Cleaner&) = default;
-
-		~Cleaner () { m_f (); }
-	private:
-		F m_f;
-};
-/**
- * Dieser Funktion kann ein Funktional übergeben werden, d.h. ein Lambda, Funktions-Zeiger,
- * oder sonstiges Objekt mit ()-Operator. Wenn das von autoClean zurückgegebene Objekt
- * zerstört wird, wird das Funktional aufgerufen. Das kann genutzt werden, um automatische
- * Aufräumarbeiten bei C-API's beim Verlassen einer Funktion/Scope vorzunehmen.
- */
-template <typename F>
-Cleaner<F> autoClean (F&& f) { return { std::forward<F> (f) }; }
 
 /**
  * Wird dieser Funktion ein libusb-Error Code übergeben, löst sie eine Exception mit der
@@ -69,22 +41,49 @@ Ret lu_err (Ret r, std::string errmsg) {
 	return r;
 }
 
+/// Ein Dummy-Struct zur Freigabe des libusb context. Kann als "Deleter" in std::unique_ptr genutzt werden.
+struct ExitLibusb {
+	void operator () (libusb_context* ctx) {
+		libusb_exit (ctx);
+	}
+};
+/// Ein libusb_context welcher in diesem unique_ptr verpackt wird, wird automatisch korrekt freigegeben.
+using CtxPtr = std::unique_ptr<libusb_context, ExitLibusb>;
+
+/// Ein Dummy-Struct zur Freigabe von libusb_device* Listen. Kann als "Deleter" in std::unique_ptr genutzt werden.
+struct FreeDeviceList {
+	void operator () (libusb_device ** list) {
+		libusb_free_device_list (list, 1);
+	}
+};
+/// Eine Liste aus libusb_device* welche in diesem unique_ptr verpackt wird, wird automatisch korrekt freigegeben.
+using DevListPtr = std::unique_ptr<libusb_device* [], FreeDeviceList>;
+
+/// Ein Dummy-Struct zur Freigabe von libusb_device_handle. Kann als "Deleter" in std::unique_ptr genutzt werden.
+struct CloseDevice {
+	void operator () (libusb_device_handle* dev) {
+		libusb_close (dev);
+	}
+};
+/// Ein libusb_device_handle welcher in diesem unique_ptr verpackt wird, wird automatisch korrekt freigegeben.
+using DevPtr = std::unique_ptr<libusb_device_handle, CloseDevice>;
+
 /**
  * Sucht ein geeignetes USB-Gerät, öffnet es und gibt das entsprechende libusb-Handle zurück.
  * Außerdem wird der USB-Deskriptor in den Parameter "desc" geschrieben. Falls kein Gerät gefunden
  * wurde, wird eine Exception ausgelöst.
  */
-libusb_device_handle* openDevice (libusb_device_descriptor& desc) {
+DevPtr openDevice (libusb_device_descriptor& desc) {
 	// Die Liste der angeschlossenen Geräte
-	libusb_device **list;
+	libusb_device **list_raw;
 	// Frage Liste ab, libusb_get_device_list allokiert Speicher
-	ssize_t cnt = lu_err(libusb_get_device_list (nullptr, &list), "Liste angeschlossener Geräte konnte nicht abgefragt werden: ");
-
-	// Lösche Liste beim Verlassen der Funktion.
-	auto c1 = autoClean ([&]() { libusb_free_device_list (list, 1); });
+	ssize_t cnt = lu_err(libusb_get_device_list (nullptr, &list_raw), "Liste angeschlossener Geräte konnte nicht abgefragt werden: ");
+	
+	// Verpacke Liste in unique_ptr für automatische Freigabe
+	DevListPtr list (list_raw);
 
 	// Iteriere gefundene Geräte
-	libusb_device_handle *handle = nullptr;
+	ssize_t iFound = -1;
 	std::cout << "Angeschlossene Geräte:\n";
 	for (ssize_t i = 0; i < cnt; i++) {
 		// Das Gerät
@@ -99,22 +98,28 @@ libusb_device_handle* openDevice (libusb_device_descriptor& desc) {
 					<< std::hex << std::setw(4) << std::setfill('0') << deviceDescriptor.idProduct << std::endl;
 
 		// Prüfe auf gewünschte VID+PID
-		if (!handle && deviceDescriptor.idVendor == 0xDEAD && deviceDescriptor.idProduct == 0xBEEF) {
-			// Gebe zurück via Out-Parameter
+		if (iFound == -1 && deviceDescriptor.idVendor == 0xDEAD && deviceDescriptor.idProduct == 0xBEEF) {
+			// Merke Index
+			iFound = i;
+			// Merke Device-Descriptor
 			std::memcpy (&desc, &deviceDescriptor, sizeof (deviceDescriptor));
-
-			// Öffne Device bereits hier und nicht nach der Schleife, damit es nicht von libusb_free_device_list gelöscht wird
-			lu_err (libusb_open (device, &handle), "Konnte Gerät nicht öffnen: ");
 		}
 	}
-	// handle wird in der Schleife initialisiert, wenn ein Gerät gefunden wurde
-	if (!handle)
+	if (iFound == -1)
 		throw std::runtime_error ("Kein passendes USB-Gerät gefunden.");
+		
+
+	// Öffne Device
+	libusb_device_handle *handle = nullptr;
+	lu_err (libusb_open (list [iFound], &handle), "Konnte Gerät nicht öffnen: ");
+	
+	// Verpacke Handle in unique_ptr für automatische Freigabe
+	DevPtr devPtr (handle);
 
 	// Beanspruche das Interface für diese Anwendung (sendet nichts auf dem Bus)
 	lu_err (libusb_claim_interface (handle, 0), "Konnte Interface nicht öffnen: ");
 
-	return handle;
+	return devPtr;
 }
 
 /**
@@ -128,21 +133,21 @@ void queryStrings (libusb_device_handle* handle, libusb_device_descriptor& found
 
 	if (foundDeviceDescriptor.iManufacturer != 0) {
 		// Frage Deskriptor ab
-		len = lu_err (libusb_get_string_descriptor_ascii (handle, foundDeviceDescriptor.iManufacturer, strBuffer, sizeof (strBuffer)), "Konnte Hersteller-String nicht abfragen: ");
+		len = lu_err (libusb_get_string_descriptor_ascii (handle, foundDeviceDescriptor.iManufacturer, strBuffer, sizeof (strBuffer)-1), "Konnte Hersteller-String nicht abfragen: ");
 		// Setze terminierendes 0-Byte
 		strBuffer [len] = 0;
 		std::cout << "Manufacturer: " << strBuffer << std::endl;
 	}
 	if (foundDeviceDescriptor.iProduct != 0) {
 		// Frage Deskriptor ab
-		len = lu_err (libusb_get_string_descriptor_ascii (handle, foundDeviceDescriptor.iProduct, strBuffer, sizeof (strBuffer)), "Konnte Produkt-String nicht abfragen: ");
+		len = lu_err (libusb_get_string_descriptor_ascii (handle, foundDeviceDescriptor.iProduct, strBuffer, sizeof (strBuffer)-1), "Konnte Produkt-String nicht abfragen: ");
 		// Setze terminierendes 0-Byte
 		strBuffer [len] = 0;
 		std::cout << "Product: " << strBuffer << std::endl;
 	}
 	if (foundDeviceDescriptor.iSerialNumber != 0) {
 		// Frage Deskriptor ab
-		len = lu_err (libusb_get_string_descriptor_ascii (handle, foundDeviceDescriptor.iSerialNumber, strBuffer, sizeof (strBuffer)), "Konnte Seriennummer-String nicht abfragen: ");
+		len = lu_err (libusb_get_string_descriptor_ascii (handle, foundDeviceDescriptor.iSerialNumber, strBuffer, sizeof (strBuffer)-1), "Konnte Seriennummer-String nicht abfragen: ");
 		// Setze terminierendes 0-Byte
 		strBuffer [len] = 0;
 		std::cout << "Serial: " << strBuffer << std::endl;
@@ -237,27 +242,23 @@ int main (int argc, char* argv []) {
 	try {
 		// Konvertiere Programmargumente in C++-Datenstruktur
 		std::vector<std::string> args (argv, argv+argc);
-
+		
 		// Initialisiere libusb
 		libusb_context* ctx;
 		lu_err (libusb_init (&ctx), "Initialisierung von libusb fehlgeschlagen: ");
-
-		// Deinitialisiere libusb automatisch beim Verlassen
-		auto c1 = autoClean ([&]() { libusb_exit (ctx); });
+		// Verpacke libusb Kontext in unique_ptr für automatische Freigabe
+		CtxPtr ctxPtr (ctx);
 
 		// Öffne Gerät
 		libusb_device_descriptor foundDeviceDescriptor {};
-		libusb_device_handle *handle = openDevice (foundDeviceDescriptor);
-
-		// Schließe Gerät automatisch beim Verlassen
-		auto c2 = autoClean ([&] () { libusb_close (handle); });
+		DevPtr handle = openDevice (foundDeviceDescriptor);
 
 		// Strings aus Device-Descriptor abfragen & ausgeben
-		queryStrings (handle, foundDeviceDescriptor);
+		queryStrings (handle.get (), foundDeviceDescriptor);
 		// LED's abfragen & setzen
-		ledHandling (handle, args);
+		ledHandling (handle.get (), args);
 		// Daten auf Bulk Endpoint 1 senden/empfangen
-		return (dataHandling (handle) ? 0 : 1);
+		return (dataHandling (handle.get ()) ? 0 : 1);
 	} catch (const std::exception& e) {
 		// Gebe Exception-Text aus
 		std::cerr << e.what () << std::endl;
@@ -265,3 +266,4 @@ int main (int argc, char* argv []) {
 		return 1;
 	}
 }
+

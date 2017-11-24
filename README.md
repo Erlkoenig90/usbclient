@@ -29,6 +29,12 @@ RelWithDebInfo | Wie Release, mit Debug-Informationen
 
 Unter Linux wird pkg-config genutzt, um libusb zu finden, welches per Paketmanager installiert werden muss. Für Windows enthält das Projekt fertig kompilierte Binaries im "libusb-msvc"-Verzeichnis, die automatisch mit gelinkt werden. Diese wurden mit und für Visual Studio 15 2017 erstellt. Für ältere Versionen können die Bibliotheksdateien von der libusb-Website heruntergeladen werden. Die statische Version davon funktioniert dann aber nicht mit der aktuellen Visual Studio-Version.
 
+Tip: Alle Dateien, die nicht zum git-Repository gehören, können so gelöscht werden:
+```shell
+git clean -fdx
+```
+So kann man die große Zahl an durch CMake und Visual Studio angelegten Dateien aufräumen, ohne den Source-Code zu löschen.
+
 ## Funktion
 Das Programm greift via libusb direkt auf ein am PC angeschlossenes Gerät zu, welches mit dem "USB-Hello-World" [f1usb](https://github.com/Erlkoenig90/f1usb) erstellt sein sollte. Es zeigt zunächst die Adressen und ID's aller angeschlossenen Geräte an, öffnet falls möglich das mit der passenden ID, und zeigt dessen String-Deskriptoren an. Es fragt den aktuellen Zustand der LED's ab, und erlaubt das Setzen der LED's auf die über zwei Kommandozeilen-Argumente anzugebenden Zustände, welche 1 oder 0 sein müssen. Außerdem sendet es eine zufällige Folge an Bytes an den Bulk Endpoint 1, empfängt die gleich lange Antwort, zeigt beide an und prüft, ob in der Antwort wie gewünscht jedes Byte umgedreht wurde. Ein Beispiel-Lauf des Programms ist (gekürzt):
 ```shell
